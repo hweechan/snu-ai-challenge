@@ -1,4 +1,4 @@
-transformers
+transformers>=4.45.0
 Pillow
 pandas
 numpy
