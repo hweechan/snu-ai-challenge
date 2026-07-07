@@ -1,54 +1,94 @@
 import argparse
+import re
 
 import pandas as pd
 import torch
 from tqdm import tqdm
-from transformers import AutoModel, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
+from qwen_vl_utils import process_vision_info
 
-from utils import ALL_PERMS, concat_images, load_images, perm_to_answer, parse_answer
+from utils import load_images, parse_answer
 
-MODEL_NAME = "google/siglip2-base-patch16-384"
+MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+PROMPT_TEMPLATE = (
+    "You are given 4 images labeled Image 1, Image 2, Image 3, Image 4, "
+    "and a sentence describing the correct sequence of events.\n"
+    "Sentence: {sentence}\n"
+    "Arrange the 4 images in the correct order that matches the sentence.\n"
+    "Reply with only a Python list like [2, 1, 4, 3] using the image numbers.\n"
+    "Do not explain."
+)
 
 
-def predict(row, model, processor, data_dir: str, device: str) -> list[int]:
+def parse_model_output(text: str) -> list[int]:
+    match = re.search(r'\[(\d)\s*,\s*(\d)\s*,\s*(\d)\s*,\s*(\d)\]', text)
+    if match:
+        result = [int(match.group(i)) for i in range(1, 5)]
+        if sorted(result) == [1, 2, 3, 4]:
+            return result
+    return [1, 2, 3, 4]
+
+
+def predict(row, model, processor, data_dir: str) -> list[int]:
     images = load_images(data_dir, row)
     sentence = row["Sentence"]
 
-    candidates = []
-    for perm in ALL_PERMS:
-        ordered = [images[i] for i in perm]
-        combined = concat_images(ordered)
-        candidates.append(combined)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": images[0]},
+                {"type": "image", "image": images[1]},
+                {"type": "image", "image": images[2]},
+                {"type": "image", "image": images[3]},
+                {"type": "text", "text": PROMPT_TEMPLATE.format(sentence=sentence)},
+            ],
+        }
+    ]
 
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
-        text=[sentence] * len(candidates),
-        images=candidates,
-        return_tensors="pt",
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
         padding=True,
-    ).to(device)
+        return_tensors="pt",
+    ).to(model.device)
 
     with torch.no_grad():
-        outputs = model(**inputs)
+        generated_ids = model.generate(**inputs, max_new_tokens=64)
 
-    logits = outputs.logits_per_image.diag()
-    best_idx = logits.argmax().item()
-    best_perm = ALL_PERMS[best_idx]
+    generated_ids_trimmed = [
+        out_ids[len(in_ids):]
+        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
 
-    return perm_to_answer(best_perm)
+    return parse_model_output(output_text)
 
 
 def run_inference(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
+    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MODEL_NAME,
+        quantization_config=quantization_config,
+        device_map="auto",
+    ).eval()
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    model = AutoModel.from_pretrained(MODEL_NAME).to(device).eval()
 
     test_df = pd.read_csv(f"{args.data_dir}/test.csv")
 
     results = []
     for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Inference"):
-        answer = predict(row, model, processor, f"{args.data_dir}/test", device)
+        if row.get("No_ordering", False):
+            answer = [1, 2, 3, 4]
+        else:
+            answer = predict(row, model, processor, f"{args.data_dir}/test")
         results.append({"Id": row["Id"], "Answer": answer})
 
     submission = pd.DataFrame(results)
@@ -60,8 +100,13 @@ def validate(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
+    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MODEL_NAME,
+        quantization_config=quantization_config,
+        device_map="auto",
+    ).eval()
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    model = AutoModel.from_pretrained(MODEL_NAME).to(device).eval()
 
     train_df = pd.read_csv(f"{args.data_dir}/train.csv")
     eval_df = train_df[train_df["No_ordering"] == False].head(200).reset_index(drop=True)
@@ -69,7 +114,7 @@ def validate(args):
 
     correct = 0
     for _, row in tqdm(eval_df.iterrows(), total=len(eval_df), desc="Validation"):
-        pred = predict(row, model, processor, f"{args.data_dir}/train", device)
+        pred = predict(row, model, processor, f"{args.data_dir}/train")
         gt = parse_answer(row["Answer"])
         if pred == gt:
             correct += 1

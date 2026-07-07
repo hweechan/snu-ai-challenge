@@ -4,3 +4,5 @@ pandas
 numpy
 tqdm
 accelerate
+qwen-vl-utils
+bitsandbytes
