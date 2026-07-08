@@ -9,7 +9,7 @@ from qwen_vl_utils import process_vision_info
 
 from utils import load_images, parse_answer
 
-MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
+MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 PROMPT_TEMPLATE = (
     "I am showing you 4 images in order: Image 1, Image 2, Image 3, Image 4.\n\n"
