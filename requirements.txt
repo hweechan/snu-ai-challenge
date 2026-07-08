@@ -5,3 +5,4 @@ numpy
 tqdm
 accelerate
 qwen-vl-utils
+peft

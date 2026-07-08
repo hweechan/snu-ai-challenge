@@ -5,3 +5,4 @@ __pycache__/
 *.pt
 submission.csv
 .env
+lora_adapter/

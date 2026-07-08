@@ -5,6 +5,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from peft import PeftModel
 from qwen_vl_utils import process_vision_info
 
 from utils import load_images, parse_answer
@@ -12,17 +13,10 @@ from utils import load_images, parse_answer
 MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 PROMPT_TEMPLATE = (
-    "I am showing you 4 images in order: Image 1, Image 2, Image 3, Image 4.\n\n"
-    "This sentence describes the correct chronological order of the events shown in these images:\n"
-    "\"{sentence}\"\n\n"
-    "Your task: determine the correct chronological order of the 4 images.\n"
-    "Think step by step:\n"
-    "1. What does each image show?\n"
-    "2. What sequence of events does the sentence describe?\n"
-    "3. Which image matches each step in the sequence?\n\n"
-    "Answer with ONLY a Python list of image numbers (1-4) in chronological order.\n"
-    "Example: [3, 1, 4, 2] means Image 3 happens first, then Image 1, then Image 4, then Image 2.\n"
-    "Answer:"
+    "These are 4 images (Image 1, Image 2, Image 3, Image 4) shown in random order.\n"
+    "Sentence: \"{sentence}\"\n"
+    "Determine the correct chronological order of images based on the sentence.\n"
+    "Reply with only a Python list like [3, 1, 4, 2]."
 )
 
 
@@ -35,6 +29,26 @@ def parse_model_output(text: str) -> list[int]:
         if sorted(result) == [0, 1, 2, 3]:
             return [x + 1 for x in result]
     return [1, 2, 3, 4]
+
+
+def load_model(args):
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    ).eval()
+
+    if args.adapter:
+        print(f"Loading LoRA adapter: {args.adapter}")
+        model = PeftModel.from_pretrained(model, args.adapter)
+        model = model.merge_and_unload()
+
+    processor = AutoProcessor.from_pretrained(
+        MODEL_NAME,
+        min_pixels=128 * 28 * 28,
+        max_pixels=256 * 28 * 28,
+    )
+    return model, processor
 
 
 def predict(row, model, processor, data_dir: str) -> list[int]:
@@ -65,7 +79,7 @@ def predict(row, model, processor, data_dir: str) -> list[int]:
     ).to(model.device)
 
     with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=256)
+        generated_ids = model.generate(**inputs, max_new_tokens=64)
 
     generated_ids_trimmed = [
         out_ids[len(in_ids):]
@@ -84,15 +98,7 @@ def predict(row, model, processor, data_dir: str) -> list[int]:
 
 
 def run_inference(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.float16,
-        device_map="auto",
-    ).eval()
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
+    model, processor = load_model(args)
 
     test_df = pd.read_csv(f"{args.data_dir}/test.csv")
 
@@ -110,15 +116,7 @@ def run_inference(args):
 
 
 def validate(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.float16,
-        device_map="auto",
-    ).eval()
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
+    model, processor = load_model(args)
 
     train_df = pd.read_csv(f"{args.data_dir}/train.csv")
     eval_df = train_df[train_df["No_ordering"] == False].head(200).reset_index(drop=True)
@@ -145,6 +143,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--output", type=str, default="submission.csv")
+    parser.add_argument("--adapter", type=str, default=None)
     parser.add_argument("--validate", action="store_true")
     args = parser.parse_args()
 
