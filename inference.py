@@ -66,6 +66,13 @@ def predict(row, model, processor, data_dir: str) -> list[int]:
     ]
     output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
 
+    if hasattr(predict, '_debug_count'):
+        predict._debug_count += 1
+    else:
+        predict._debug_count = 1
+    if predict._debug_count <= 10:
+        print(f"  raw output: {output_text!r}")
+
     return parse_model_output(output_text)
 
 
@@ -111,14 +118,20 @@ def validate(args):
     print(f"Evaluating on {len(eval_df)} samples")
 
     correct = 0
-    for _, row in tqdm(eval_df.iterrows(), total=len(eval_df), desc="Validation"):
+    fallback_count = 0
+    for i, (_, row) in enumerate(tqdm(eval_df.iterrows(), total=len(eval_df), desc="Validation")):
         pred = predict(row, model, processor, f"{args.data_dir}/train")
         gt = parse_answer(row["Answer"])
+        if pred == [1, 2, 3, 4] and gt != [1, 2, 3, 4]:
+            fallback_count += 1
         if pred == gt:
             correct += 1
+        if i < 10:
+            print(f"  [{i}] pred={pred} gt={gt} {'OK' if pred == gt else 'X'}")
 
     acc = correct / len(eval_df)
     print(f"Exact Match Accuracy: {acc:.4f} ({correct}/{len(eval_df)})")
+    print(f"Fallback to [1,2,3,4] (parse fail): {fallback_count}/{len(eval_df)}")
 
 
 if __name__ == "__main__":
