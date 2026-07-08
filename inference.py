@@ -4,7 +4,7 @@ import re
 import pandas as pd
 import torch
 from tqdm import tqdm
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
 from utils import load_images, parse_answer
@@ -73,10 +73,9 @@ def run_inference(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         MODEL_NAME,
-        quantization_config=quantization_config,
+        torch_dtype=torch.float16,
         device_map="auto",
     ).eval()
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
@@ -100,10 +99,9 @@ def validate(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         MODEL_NAME,
-        quantization_config=quantization_config,
+        torch_dtype=torch.float16,
         device_map="auto",
     ).eval()
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
