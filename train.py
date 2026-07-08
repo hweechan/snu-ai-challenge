@@ -136,8 +136,17 @@ def train(args):
                 optimizer.step()
                 optimizer.zero_grad()
 
+            if num_steps > 0 and num_steps % args.save_every == 0:
+                save_path = f"{args.output_dir}/step_{num_steps}"
+                model.save_pretrained(save_path)
+                print(f"\nCheckpoint saved: {save_path}")
+
             if num_steps > 0:
                 pbar.set_postfix(loss=f"{total_loss / num_steps:.4f}")
+
+            if args.max_steps and num_steps >= args.max_steps:
+                print(f"\nReached max_steps={args.max_steps}, stopping.")
+                break
 
         if len(df) % args.grad_accum != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -163,5 +172,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--save_every", type=int, default=500)
     args = parser.parse_args()
     train(args)
