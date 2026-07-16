@@ -6,3 +6,4 @@ tqdm
 accelerate
 qwen-vl-utils
 peft
+bitsandbytes
