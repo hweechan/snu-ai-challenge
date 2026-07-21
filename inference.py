@@ -36,7 +36,7 @@ def load_model(args):
         MODEL_NAME,
         torch_dtype=torch.float16,
         device_map="auto",
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     ).eval()
 
     if args.adapter:

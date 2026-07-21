@@ -82,7 +82,7 @@ def train(args):
         MODEL_NAME,
         quantization_config=bnb_config,
         device_map="auto",
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     )
 
     if args.resume_adapter:
