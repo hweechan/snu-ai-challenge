@@ -7,3 +7,4 @@ accelerate
 qwen-vl-utils
 peft
 bitsandbytes
+flash-attn

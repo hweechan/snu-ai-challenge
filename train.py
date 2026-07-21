@@ -1,4 +1,5 @@
 import argparse
+import math
 
 import pandas as pd
 import torch
@@ -9,7 +10,7 @@ from transformers import (
     AutoProcessor,
     BitsAndBytesConfig,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel
 from qwen_vl_utils import process_vision_info
 
 from utils import load_images
@@ -50,11 +51,30 @@ def collate_fn(batch):
     return [s for s in batch if s is not None]
 
 
+def find_assistant_start(input_ids, tokenizer):
+    """Find the token position where the assistant's answer starts."""
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    assistant_token_ids = tokenizer.encode("assistant", add_special_tokens=False)
+
+    input_list = input_ids[0].tolist()
+    last_assistant_pos = -1
+
+    for i in range(len(input_list) - len(assistant_token_ids)):
+        if input_list[i] == im_start_id:
+            chunk = input_list[i + 1 : i + 1 + len(assistant_token_ids)]
+            if chunk == assistant_token_ids:
+                last_assistant_pos = i + 1 + len(assistant_token_ids) + 1
+
+    return last_assistant_pos
+
+
 def train(args):
+    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_use_double_quant=True,
     )
 
@@ -62,27 +82,45 @@ def train(args):
         MODEL_NAME,
         quantization_config=bnb_config,
         device_map="auto",
-    )
-    model = prepare_model_for_kbit_training(
-        model,
-        use_gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        attn_implementation="flash_attention_2",
     )
 
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=0.05,
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
+    if args.resume_adapter:
+        print(f"Resuming from adapter: {args.resume_adapter}")
+        model = PeftModel.from_pretrained(
+            model,
+            args.resume_adapter,
+            is_trainable=True,
+        )
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+    else:
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_r * 2,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            lora_dropout=0.05,
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+
     model.print_trainable_parameters()
 
     processor = AutoProcessor.from_pretrained(
         MODEL_NAME,
-        min_pixels=128 * 28 * 28,
-        max_pixels=256 * 28 * 28,
+        min_pixels=args.min_pixels * 28 * 28,
+        max_pixels=args.max_pixels * 28 * 28,
     )
 
     dataset = TrainDataset(f"{args.data_dir}/train.csv", f"{args.data_dir}/train")
@@ -103,6 +141,17 @@ def train(args):
         lr=args.lr,
         weight_decay=0.01,
     )
+
+    total_steps = len(dataloader) * args.epochs // args.grad_accum
+    warmup_steps = min(int(total_steps * 0.05), 50)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     effective_batch = args.batch_size * args.grad_accum
 
@@ -160,16 +209,21 @@ def train(args):
                         return_tensors="pt",
                     ).to(model.device)
 
-                    answer_ids = processor.tokenizer.encode(
-                        answer, add_special_tokens=False
-                    )
-                    # +1 for <|im_end|> token
-                    prompt_len = (
-                        full_inputs["input_ids"].shape[1] - len(answer_ids) - 1
-                    )
-
                     labels = full_inputs["input_ids"].clone()
-                    labels[:, :prompt_len] = -100
+
+                    assistant_start = find_assistant_start(
+                        full_inputs["input_ids"], processor.tokenizer
+                    )
+                    if assistant_start > 0:
+                        labels[:, :assistant_start] = -100
+                    else:
+                        answer_ids = processor.tokenizer.encode(
+                            answer, add_special_tokens=False
+                        )
+                        prompt_len = (
+                            full_inputs["input_ids"].shape[1] - len(answer_ids) - 1
+                        )
+                        labels[:, :prompt_len] = -100
 
                     outputs = model(**full_inputs, labels=labels)
                     loss = outputs.loss / effective_batch
@@ -190,10 +244,15 @@ def train(args):
             if global_step % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
 
             if epoch_samples > 0:
-                pbar.set_postfix(loss=f"{total_loss / epoch_samples:.4f}")
+                current_lr = scheduler.get_last_lr()[0]
+                pbar.set_postfix(
+                    loss=f"{total_loss / epoch_samples:.4f}",
+                    lr=f"{current_lr:.2e}",
+                )
 
             if sample_count > 0 and sample_count % args.save_every == 0:
                 save_path = f"{args.output_dir}/step_{sample_count}"
@@ -207,6 +266,7 @@ def train(args):
         if global_step % args.grad_accum != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
 
         avg_loss = total_loss / max(epoch_samples, 1)
@@ -225,12 +285,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--output_dir", type=str, default="lora_adapter")
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--resume_adapter", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_accum", type=int, default=1)
+    parser.add_argument("--grad_accum", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--lora_r", type=int, default=64)
+    parser.add_argument("--min_pixels", type=int, default=64)
+    parser.add_argument("--max_pixels", type=int, default=128)
     args = parser.parse_args()
     train(args)
