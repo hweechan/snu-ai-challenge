@@ -87,15 +87,15 @@ def train(args):
 
     if args.resume_adapter:
         print(f"Resuming from adapter: {args.resume_adapter}")
-        model = PeftModel.from_pretrained(
-            model,
-            args.resume_adapter,
-            is_trainable=True,
-        )
         model = prepare_model_for_kbit_training(
             model,
             use_gradient_checkpointing=True,
             gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+        model = PeftModel.from_pretrained(
+            model,
+            args.resume_adapter,
+            is_trainable=True,
         )
     else:
         model = prepare_model_for_kbit_training(
