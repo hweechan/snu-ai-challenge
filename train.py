@@ -1,5 +1,7 @@
 import argparse
+import json
 import math
+import os
 
 import pandas as pd
 import torch
@@ -85,8 +87,9 @@ def train(args):
         attn_implementation="sdpa",
     )
 
-    if args.resume_adapter:
-        print(f"Resuming from adapter: {args.resume_adapter}")
+    resume_adapter = args.resume_checkpoint or args.resume_adapter
+    if resume_adapter:
+        print(f"Resuming from adapter: {resume_adapter}")
         model = prepare_model_for_kbit_training(
             model,
             use_gradient_checkpointing=True,
@@ -94,7 +97,7 @@ def train(args):
         )
         model = PeftModel.from_pretrained(
             model,
-            args.resume_adapter,
+            resume_adapter,
             is_trainable=True,
         )
     else:
@@ -155,11 +158,41 @@ def train(args):
 
     effective_batch = args.batch_size * args.grad_accum
 
-    model.train()
+    start_epoch = 0
     global_step = 0
     sample_count = 0
 
-    for epoch in range(args.epochs):
+    if args.resume_checkpoint:
+        ckpt_state_path = os.path.join(args.resume_checkpoint, "training_state.json")
+        if os.path.exists(ckpt_state_path):
+            with open(ckpt_state_path) as f:
+                state = json.load(f)
+            start_epoch = state["epoch"]
+            global_step = state["global_step"]
+            sample_count = state["sample_count"]
+            print(f"Resuming from epoch {start_epoch}, step {global_step}, samples {sample_count}")
+
+        optim_path = os.path.join(args.resume_checkpoint, "optimizer.pt")
+        if os.path.exists(optim_path):
+            optimizer.load_state_dict(torch.load(optim_path, map_location="cpu"))
+            for _ in range(global_step // args.grad_accum):
+                scheduler.step()
+            print("Optimizer & scheduler state restored")
+
+    def save_checkpoint(path, epoch, global_step, sample_count):
+        model.save_pretrained(path)
+        torch.save(optimizer.state_dict(), os.path.join(path, "optimizer.pt"))
+        with open(os.path.join(path, "training_state.json"), "w") as f:
+            json.dump({
+                "epoch": epoch,
+                "global_step": global_step,
+                "sample_count": sample_count,
+            }, f)
+        print(f"\nCheckpoint saved: {path}")
+
+    model.train()
+
+    for epoch in range(start_epoch, args.epochs):
         total_loss = 0
         epoch_samples = 0
 
@@ -256,8 +289,7 @@ def train(args):
 
             if sample_count > 0 and sample_count % args.save_every == 0:
                 save_path = f"{args.output_dir}/step_{sample_count}"
-                model.save_pretrained(save_path)
-                print(f"\nCheckpoint saved: {save_path}")
+                save_checkpoint(save_path, epoch, global_step, sample_count)
 
             if args.max_steps and global_step >= args.max_steps:
                 print(f"\nReached max_steps={args.max_steps}, stopping.")
@@ -273,8 +305,7 @@ def train(args):
         print(f"Epoch {epoch+1}/{args.epochs}, Avg Loss: {avg_loss:.4f}")
 
         save_path = f"{args.output_dir}/epoch_{epoch+1}"
-        model.save_pretrained(save_path)
-        print(f"Saved: {save_path}")
+        save_checkpoint(save_path, epoch + 1, global_step, sample_count)
 
     model.save_pretrained(args.output_dir)
     processor.save_pretrained(args.output_dir)
@@ -286,6 +317,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--output_dir", type=str, default="lora_adapter")
     parser.add_argument("--resume_adapter", type=str, default=None)
+    parser.add_argument("--resume_checkpoint", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--batch_size", type=int, default=4)
